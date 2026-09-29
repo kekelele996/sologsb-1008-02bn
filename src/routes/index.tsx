@@ -1,7 +1,25 @@
 import { $, component$, useSignal, useVisibleTask$, type QRL } from "@builder.io/qwik";
 import { type DocumentHead } from "@builder.io/qwik-city";
-import { createSeedProject, STATUS_LABELS, uid } from "../data";
-import type { ReviewStatus, SignItem, SignProject } from "../types";
+import {
+  BATCH_STATUS_LABELS,
+  RECALL_DECISION_LABELS,
+  createBatch,
+  createRecallSession,
+  createSeedProject,
+  findBatch,
+  findLatestBatchForSign,
+  findPendingRecall,
+  findRecallSession,
+  getRecallProgress,
+  isRecallResolved,
+  normalizeProject,
+  restoreSnapshot,
+  signFromSnapshot,
+  snapshotMatchesSign,
+  STATUS_LABELS,
+  uid,
+} from "../data";
+import type { PublishBatch, RecallDecision, RecallSession, ReviewStatus, SignItem, SignProject } from "../types";
 import { analyzeSign, cloneTerms, diffText } from "../utils";
 
 const STORAGE_KEY = "sologsb-1008-project-v1";
@@ -38,6 +56,10 @@ export default component$(() => {
   const toast = useSignal("");
   const previewId = useSignal("");
   const readOnly = useSignal(false);
+  const selectedSignIds = useSignal<string[]>([]);
+  const publishOpen = useSignal(false);
+  const batchLabel = useSignal("");
+  const recallSessionId = useSignal("");
   const active = () => project.value.signs.find((sign) => sign.id === (previewId.value || project.value.activeSignId)) ?? project.value.signs[0];
 
   const commit = $((label: string, update: (draft: SignProject) => void) => {
@@ -174,6 +196,108 @@ export default component$(() => {
     toast.value = "只读预览链接已复制";
   });
 
+  const toggleSelected = $((signId: string) => {
+    selectedSignIds.value = selectedSignIds.value.includes(signId)
+      ? selectedSignIds.value.filter((id) => id !== signId)
+      : [...selectedSignIds.value, signId];
+  });
+
+  const openPublish = $(() => {
+    if (findPendingRecall(project.value)) {
+      toast.value = "请先处理完当前撤回批次";
+      return;
+    }
+    if (!selectedSignIds.value.length) {
+      toast.value = "请先勾选要发布的标识";
+      return;
+    }
+    batchLabel.value = `第 ${project.value.batches.length + 1} 批 · ${new Date().toLocaleDateString()}`;
+    publishOpen.value = true;
+  });
+
+  const confirmPublish = $(() => {
+    const ids = selectedSignIds.value;
+    const signs = project.value.signs.filter((sign) => ids.includes(sign.id));
+    if (!signs.length) return;
+    const batch = createBatch(signs, batchLabel.value || `第 ${project.value.batches.length + 1} 批`);
+    commit("确认发布批次", (draft) => {
+      draft.batches.unshift(batch);
+    });
+    publishOpen.value = false;
+    selectedSignIds.value = [];
+    toast.value = `已发布 ${batch.signs.length} 处标识，内容已冻结`;
+  });
+
+  const startRecall = $((batchId: string) => {
+    if (findPendingRecall(project.value)) {
+      toast.value = "请先处理完当前撤回批次";
+      return;
+    }
+    const batch = project.value.batches.find((item) => item.id === batchId);
+    if (!batch || batch.status !== "published") return;
+    const session = createRecallSession(batch, project.value.signs);
+    commit("发起发布撤回", (draft) => {
+      const target = draft.batches.find((item) => item.id === batchId);
+      if (target) target.status = "recalling";
+      draft.recallSessions.unshift(session);
+    });
+    recallSessionId.value = session.id;
+    toast.value = "批次已进入撤回处理，请逐条选择处理方式";
+  });
+
+  const resumeRecall = $((sessionId: string) => {
+    recallSessionId.value = sessionId;
+  });
+
+  /**
+   * 逐条处理：采用发布版会把发布快照还原到工作区；保留本机版则还原发起撤回时冻结的本机基线。
+   * 两者都基于快照还原，因此选择可以反复修改且互不冲掉；本机撤回发起后再做的修改属于撤回处理范围。
+   */
+  const decideRecallItem = $((sessionId: string, signId: string, decision: RecallDecision) => {
+    const batchId = project.value.recallSessions.find((session) => session.id === sessionId)?.batchId;
+    const batch = project.value.batches.find((item) => item.id === batchId);
+    const session = project.value.recallSessions.find((item) => item.id === sessionId);
+    const published = batch?.signs.find((item) => item.signId === signId);
+    const baseline = session?.baseline.find((item) => item.signId === signId);
+    if (!batch || !session || !published || !baseline) return;
+    commit("撤回逐条选择", (draft) => {
+      const draftSession = draft.recallSessions.find((item) => item.id === sessionId);
+      let sign = draft.signs.find((item) => item.id === signId);
+      if (!draftSession) return;
+      if (!sign) {
+        // 该标识已在本机删除：仅在“采用发布版”时按发布快照重建。
+        if (decision === "restore") {
+          sign = signFromSnapshot(published);
+          draft.signs.push(sign);
+        }
+      } else {
+        restoreSnapshot(sign, decision === "restore" ? published : baseline);
+      }
+      draftSession.decisions[signId] = decision;
+    });
+  });
+
+  const completeRecall = $(() => {
+    const session = findRecallSession(project.value, recallSessionId.value);
+    const batch = session ? findBatch(project.value, session.batchId) : undefined;
+    if (!session || !batch) return;
+    if (!isRecallResolved(batch, session)) {
+      toast.value = "还有标识未选择处理方式";
+      return;
+    }
+    commit("完成批次撤回", (draft) => {
+      const target = draft.batches.find((item) => item.id === batch.id);
+      if (target) target.status = "recalled";
+      draft.recallSessions = draft.recallSessions.filter((item) => item.id !== session.id);
+    });
+    recallSessionId.value = "";
+    toast.value = "批次已撤回";
+  });
+
+  const cancelRecallSession = $(() => {
+    recallSessionId.value = "";
+  });
+
   const preview = () => analyzeSign(active(), previewWidth.value, previewFont.value);
   const selectedVersion = () => active().versions.find((version) => version.id === selectedVersionId.value) ?? active().versions[0];
   const comparison = () => {
@@ -186,7 +310,15 @@ export default component$(() => {
     if (!hydrated.value) {
       try {
         const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: SignProject };
-        if (stored.schema === 1 && stored.project?.signs?.length) project.value = stored.project;
+        if (stored.schema === 1 && stored.project?.signs?.length) {
+          project.value = normalizeProject(stored.project);
+          // 关页中断后回来：恢复尚未处理完的撤回会话（批次仍停留在“撤回处理中”，不显示为已发布）。
+          const unfinished = project.value.recallSessions.find((session) => {
+            const batch = project.value.batches.find((item) => item.id === session.batchId);
+            return batch?.status === "recalling";
+          });
+          if (unfinished) recallSessionId.value = unfinished.id;
+        }
         const requestedPreview = new URLSearchParams(window.location.search).get("preview") ?? "";
         previewId.value = requestedPreview;
         readOnly.value = Boolean(requestedPreview);
@@ -244,6 +376,18 @@ export default component$(() => {
       window.removeEventListener("keydown", keydown);
     });
   });
+
+  const pendingRecallSession = findPendingRecall(project.value);
+  const pendingRecallBatch = pendingRecallSession
+    ? findBatch(project.value, pendingRecallSession.batchId)
+    : undefined;
+  const publishSelection = publishOpen.value
+    ? project.value.signs.filter((sign) => selectedSignIds.value.includes(sign.id))
+    : [];
+  const recallSession = findRecallSession(project.value, recallSessionId.value);
+  const recallBatch = recallSession
+    ? findBatch(project.value, recallSession.batchId)
+    : undefined;
 
   if (readOnly.value) {
     const sign = active();
@@ -308,40 +452,88 @@ export default component$(() => {
         </div>
       )}
 
+      {pendingRecallSession && pendingRecallBatch && (
+        <div class="alert alert-warning sticky top-16 z-30 rounded-none border-x-0 py-2">
+          <span class="text-lg">↩</span>
+          <span class="flex-1">
+            批次 <strong>{pendingRecallBatch.label}</strong> 正在撤回处理：已处理 {getRecallProgress(pendingRecallBatch, pendingRecallSession)}/{pendingRecallBatch.signs.length}。
+            处理完成前该批次不会显示为已发布。
+          </span>
+          {recallSessionId.value !== pendingRecallSession.id && (
+            <button class="btn btn-sm btn-warning" onClick$={() => resumeRecall(pendingRecallSession!.id)}>继续处理</button>
+          )}
+        </div>
+      )}
+
       <div class="grid min-h-[calc(100vh-64px)] grid-cols-[270px_minmax(560px,1fr)_430px] gap-px bg-slate-300">
-        <aside class="overflow-y-auto bg-slate-50 p-3">
+        <aside class="flex flex-col overflow-y-auto bg-slate-50 p-3">
           <div class="mb-3 rounded-xl bg-white p-4 shadow-sm">
             <div class="text-xs font-bold uppercase tracking-[0.16em] text-slate-400">标识清单</div>
             <div class="mt-1 text-lg font-bold text-slate-800">{project.value.signs.length} 处标识</div>
             <p class="mt-1 text-xs leading-5 text-slate-500">{project.value.location}</p>
           </div>
-          <div class="space-y-2">
+          <div class="flex-1 space-y-2 pb-3">
             {project.value.signs.map((sign, index) => {
               const risk = analyzeSign(sign, previewWidth.value, previewFont.value);
+              const checked = selectedSignIds.value.includes(sign.id);
+              const batch = findLatestBatchForSign(project.value, sign.id);
+              const recallLocked = Boolean(pendingRecallSession);
               return (
-                <button
+                <div
                   key={sign.id}
-                  class={`w-full rounded-xl border p-3 text-left transition ${sign.id === project.value.activeSignId ? "border-blue-400 bg-blue-50 shadow-sm" : "border-slate-200 bg-white hover:border-slate-300"}`}
-                  onClick$={() => {
-                    commit("切换标识", (draft) => { draft.activeSignId = sign.id; });
-                    selectedVersionId.value = "";
-                  }}
+                  class={`relative rounded-xl border p-3 pr-9 transition ${sign.id === project.value.activeSignId ? "border-blue-400 bg-blue-50 shadow-sm" : "border-slate-200 bg-white hover:border-slate-300"} ${checked ? "ring-2 ring-blue-500" : ""}`}
                 >
-                  <div class="flex items-center justify-between">
-                    <span class="font-mono text-xs font-bold text-slate-500">{sign.code}</span>
-                    <span class={`badge badge-sm ${statusClass(sign.status)}`}>{STATUS_LABELS[sign.status]}</span>
-                  </div>
-                  <div class="mt-2 line-clamp-2 text-sm font-semibold text-slate-700">{sign.sourceText}</div>
-                  <div class="mt-2 flex items-center justify-between text-[11px] text-slate-500">
-                    <span>{sign.targetLanguage}</span>
-                    <span class={risk.risk === "high" ? "font-bold text-error" : risk.risk === "medium" ? "font-bold text-warning" : "text-success"}>
-                      {risk.risk === "high" ? "高风险" : risk.risk === "medium" ? "需留意" : "版面正常"}
-                    </span>
-                  </div>
-                  <span class="sr-only">第 {index + 1} 条</span>
-                </button>
+                  <button
+                    class="block w-full text-left"
+                    onClick$={() => {
+                      commit("切换标识", (draft) => { draft.activeSignId = sign.id; });
+                      selectedVersionId.value = "";
+                    }}
+                  >
+                    <div class="flex items-center justify-between gap-2">
+                      <span class="font-mono text-xs font-bold text-slate-500">{sign.code}</span>
+                      <span class={`badge badge-sm ${statusClass(sign.status)}`}>{STATUS_LABELS[sign.status]}</span>
+                    </div>
+                    <div class="mt-2 line-clamp-2 text-sm font-semibold text-slate-700">{sign.sourceText}</div>
+                    <div class="mt-2 flex items-center justify-between text-[11px] text-slate-500">
+                      <span>{sign.targetLanguage}</span>
+                      <span class={risk.risk === "high" ? "font-bold text-error" : risk.risk === "medium" ? "font-bold text-warning" : "text-success"}>
+                        {risk.risk === "high" ? "高风险" : risk.risk === "medium" ? "需留意" : "版面正常"}
+                      </span>
+                    </div>
+                    {batch && (
+                      <div class={`mt-2 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-bold ${batch.status === "recalling" ? "bg-error/10 text-error" : "bg-success/10 text-success"}`}>
+                        <span>{batch.status === "recalling" ? "↩ " : "● "}</span>
+                        {BATCH_STATUS_LABELS[batch.status]}
+                      </div>
+                    )}
+                    <span class="sr-only">第 {index + 1} 条</span>
+                  </button>
+                  <input
+                    type="checkbox"
+                    class="checkbox checkbox-sm absolute right-2 top-2"
+                    aria-label={`选择标识 ${sign.code} 加入发布批次`}
+                    title={recallLocked ? "撤回处理期间不能发布新批次" : "加入发布批次"}
+                    checked={checked}
+                    disabled={recallLocked}
+                    onChange$={() => toggleSelected(sign.id)}
+                  />
+                </div>
               );
             })}
+          </div>
+          <div class="sticky bottom-0 -mx-3 border-t border-slate-200 bg-white/95 p-3 backdrop-blur">
+            {pendingRecallSession ? (
+              <div class="rounded-lg bg-error/10 p-2 text-center text-xs font-bold text-error">撤回处理中，暂不能发布新批次</div>
+            ) : (
+              <div class="space-y-2">
+                <div class="text-xs text-slate-500">已选 <strong class="text-slate-800">{selectedSignIds.value.length}</strong> 处标识，发布时冻结整组译文、术语、意见与状态。</div>
+                <div class="flex gap-2">
+                  <button class="btn btn-sm flex-1 btn-primary" disabled={!selectedSignIds.value.length} onClick$={openPublish}>批量确认发布</button>
+                  <button class="btn btn-sm btn-ghost" disabled={!selectedSignIds.value.length} onClick$={() => { selectedSignIds.value = []; }}>清空</button>
+                </div>
+              </div>
+            )}
           </div>
         </aside>
 
@@ -544,6 +736,57 @@ export default component$(() => {
               </div>
             </div>
 
+            <div class="card border border-slate-200 bg-white shadow-sm">
+              <div class="card-body p-4">
+                <div class="flex items-center justify-between">
+                  <div>
+                    <h2 class="font-bold">发布批次</h2>
+                    <p class="text-xs text-slate-500">批量确认即冻结整组内容，后续可撤回任一发布点。</p>
+                  </div>
+                  <span class="badge badge-outline">{project.value.batches.length} 批</span>
+                </div>
+                {project.value.batches.length === 0 ? (
+                  <div class="mt-3 rounded-xl border border-dashed p-5 text-center text-xs text-slate-400">
+                    在左侧勾选标识后批量确认，将生成第一个发布批次。
+                  </div>
+                ) : (
+                  <div class="mt-3 space-y-2">
+                    {project.value.batches.map((batch) => (
+                      <div key={batch.id} class="rounded-xl border border-slate-200 p-3">
+                        <div class="flex items-center justify-between gap-2">
+                          <div class="min-w-0">
+                            <div class="truncate text-sm font-bold">{batch.label}</div>
+                            <div class="text-[11px] text-slate-400">{new Date(batch.createdAt).toLocaleString()} · {batch.signs.length} 处</div>
+                          </div>
+                          <span class={`badge badge-sm ${batch.status === "published" ? "badge-success" : batch.status === "recalling" ? "badge-error" : "badge-ghost"}`}>
+                            {BATCH_STATUS_LABELS[batch.status]}
+                          </span>
+                        </div>
+                        <div class="mt-2 flex flex-wrap gap-1">
+                          {batch.signs.map((snapshot) => (
+                            <span key={snapshot.signId} class="badge badge-xs badge-ghost font-mono">{snapshot.code}</span>
+                          ))}
+                        </div>
+                        {batch.status === "published" && (
+                          <button class="btn btn-xs btn-outline btn-error mt-2 w-full" disabled={Boolean(pendingRecallSession)} onClick$={() => startRecall(batch.id)}>
+                            撤回此发布点
+                          </button>
+                        )}
+                        {batch.status === "recalling" && (
+                          <button class="btn btn-xs btn-error mt-2 w-full" onClick$={() => {
+                            const session = project.value.recallSessions.find((item) => item.batchId === batch.id);
+                            if (session) resumeRecall(session.id);
+                          }}>
+                            继续撤回处理
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+
             <div class="rounded-xl bg-[#17324d] p-4 text-xs text-slate-200">
               <div class="mb-2 font-bold text-white">键盘操作</div>
               <div class="grid grid-cols-2 gap-y-1"><span><kbd class="kbd kbd-xs">J/K</kbd> 切换标识</span><span><kbd class="kbd kbd-xs">[ ]</kbd> 预览宽度</span><span><kbd class="kbd kbd-xs">- =</kbd> 字号</span><span><kbd class="kbd kbd-xs">Ctrl/⌘ Z</kbd> 撤销</span></div>
@@ -552,7 +795,135 @@ export default component$(() => {
         </aside>
       </div>
 
-      {toast.value && <div class="toast toast-end z-50"><div class="alert alert-success"><span>{toast.value}</span></div></div>}
+      {false && publishOpen.value && (
+        <div class="modal modal-open z-50" role="dialog" aria-modal="true" aria-label="确认发布批次">
+          <div class="modal-box max-w-2xl">
+            <h3 class="text-lg font-bold">确认发布批次</h3>
+            <p class="py-2 text-sm text-slate-500">
+              发布后将冻结这 {publishSelection.length} 处标识的原文、译文、术语、审校意见与审校状态。后续发现术语译错时，可从发布批次整批撤回。
+            </p>
+            <label class="form-control mt-2">
+              <span class="label-text text-xs font-bold text-slate-500">批次名称</span>
+              <input class="input input-bordered input-sm mt-1" value={batchLabel.value} onInput$={(_, element) => { batchLabel.value = element.value; }} />
+            </label>
+            <div class="mt-3 max-h-60 space-y-1 overflow-y-auto rounded-xl border border-slate-200 p-2">
+              {publishSelection.map((sign) => (
+                <div key={sign.id} class="flex items-center justify-between gap-2 rounded-lg bg-slate-50 px-3 py-2 text-sm">
+                  <span class="font-mono text-xs font-bold text-slate-500">{sign.code}</span>
+                  <span class="flex-1 truncate">{sign.sourceText}</span>
+                  <span class={`badge badge-xs ${statusClass(sign.status)}`}>{STATUS_LABELS[sign.status]}</span>
+                </div>
+              ))}
+            </div>
+            <div class="modal-action">
+              <button class="btn btn-ghost btn-sm" onClick$={() => { publishOpen.value = false; }}>取消</button>
+              <button class="btn btn-primary btn-sm" onClick$={confirmPublish}>确认冻结并发布</button>
+            </div>
+          </div>
+          <div class="modal-backdrop" onClick$={() => { publishOpen.value = false; }} />
+        </div>
+      )}
+
+      {recallSession && recallBatch && (
+        <div class="modal modal-open z-50" role="dialog" aria-modal="true" aria-label="撤回发布批次处理">
+          <div class="modal-box max-w-4xl">
+            <div class="flex items-start justify-between gap-4">
+              <div>
+                <h3 class="text-lg font-bold">撤回发布批次 · {recallBatch.label}</h3>
+                <p class="mt-1 text-sm text-slate-500">
+                  逐条选择：<strong class="text-error">采用发布版</strong>会用发布时冻结的译文、术语、意见和审校状态还原该条；
+                  <strong class="text-slate-700">保留本机版</strong>会还原发起撤回时记录的本机内容，不会冲掉你的未发布修改。两个选择可反复切换，随时关闭页面，进度会保存并可继续。
+                </p>
+              </div>
+              <span class={`badge badge-sm ${getRecallProgress(recallBatch, recallSession) === recallBatch.signs.length ? "badge-success" : "badge-error"}`}>{getRecallProgress(recallBatch, recallSession)}/{recallBatch.signs.length}</span>
+            </div>
+            <div class="mt-4 max-h-[55vh] space-y-3 overflow-y-auto pr-1">
+              {recallBatch.signs.map((snapshot) => {
+                const current = project.value.signs.find((sign) => sign.id === snapshot.signId);
+                const decision = recallSession.decisions[snapshot.signId];
+                const identical = snapshotMatchesSign(snapshot, current);
+                const tokens = current ? diffText(snapshot.targetText, current.targetText) : [];
+                return (
+                  <article key={snapshot.signId} class={`rounded-xl border p-3 ${decision ? "border-success/50 bg-success/5" : "border-slate-300 bg-white"}`}>
+                    <div class="flex flex-wrap items-center justify-between gap-2">
+                      <div class="text-sm">
+                        <span class="font-mono text-xs font-bold text-slate-500">{snapshot.code}</span>
+                        <span class="ml-2 font-semibold">{snapshot.sourceText}</span>
+                      </div>
+                      <div class="flex items-center gap-2">
+                        {identical && <span class="badge badge-xs badge-ghost">本机与发布版一致</span>}
+                        <span class={`badge badge-xs ${decision ? "badge-success" : "badge-warning"}`}>
+                          {decision ? RECALL_DECISION_LABELS[decision] : "待选择"}
+                        </span>
+                      </div>
+                    </div>
+                    <div class="mt-2 grid gap-2 md:grid-cols-2">
+                      <div class="rounded-lg border border-slate-200 bg-slate-50 p-2">
+                        <div class="mb-1 flex items-center justify-between text-[11px] font-bold text-slate-500">
+                          <span>发布版（{new Date(recallBatch.createdAt).toLocaleDateString()} 冻结）</span>
+                          <span class={`badge badge-xs ${statusClass(snapshot.status)}`}>{STATUS_LABELS[snapshot.status]}</span>
+                        </div>
+                        <p class="whitespace-pre-line text-xs leading-5">{snapshot.targetText}</p>
+                        <div class="mt-1 flex flex-wrap gap-1">
+                          {snapshot.terms.map((term) => (
+                            <span key={term.id} class="badge badge-xs badge-ghost">{term.source}→{term.target}</span>
+                          ))}
+                        </div>
+                        <div class="mt-1 text-[11px] text-slate-400">审校意见 {snapshot.comments.length} 条</div>
+                      </div>
+                      <div class="rounded-lg border border-slate-200 bg-white p-2">
+                        <div class="mb-1 flex items-center justify-between text-[11px] font-bold text-slate-500">
+                          <span>本机当前（未发布）</span>
+                          {current && <span class={`badge badge-xs ${statusClass(current.status)}`}>{STATUS_LABELS[current.status]}</span>}
+                        </div>
+                        {current ? (
+                          <>
+                            <div class="whitespace-pre-line text-xs leading-5">
+                              {tokens.map((token, index) => (
+                                <span key={index} class={token.type === "add" ? "rounded bg-green-200/70 text-green-900" : token.type === "remove" ? "bg-red-200/70 text-red-900 line-through" : ""}>{token.value}</span>
+                              ))}
+                            </div>
+                            <div class="mt-1 flex flex-wrap gap-1">
+                              {current.terms.map((term) => (
+                                <span key={term.id} class="badge badge-xs badge-ghost">{term.source}→{term.target}</span>
+                              ))}
+                            </div>
+                            <div class="mt-1 text-[11px] text-slate-400">审校意见 {current.comments.length} 条</div>
+                          </>
+                        ) : (
+                          <div class="text-xs text-error">该标识已在本机删除。</div>
+                        )}
+                      </div>
+                    </div>
+                    <div class="mt-2 flex gap-2">
+                      <button
+                        class={`btn btn-sm flex-1 ${decision === "restore" ? "btn-error" : "btn-outline btn-error"}`}
+                        onClick$={() => decideRecallItem(recallSession.id, snapshot.signId, "restore")}
+                      >
+                        采用发布版（还原该条）
+                      </button>
+                      <button
+                        class={`btn btn-sm flex-1 ${decision === "keep" ? "btn-primary" : "btn-outline"}`}
+                        onClick$={() => decideRecallItem(recallSession.id, snapshot.signId, "keep")}
+                      >
+                        保留本机版
+                      </button>
+                    </div>
+                  </article>
+                );
+              })}
+            </div>
+            <div class="modal-action">
+              <button class="btn btn-ghost btn-sm" onClick$={cancelRecallSession}>稍后继续（关闭，进度保留）</button>
+              <button class="btn btn-primary btn-sm" disabled={getRecallProgress(recallBatch, recallSession) !== recallBatch.signs.length} onClick$={completeRecall}>
+                全部处理完，完成撤回
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {toast.value && <div class="toast toast-end z-[60]"><div class="alert alert-success"><span>{toast.value}</span></div></div>}
     </div>
   );
 });

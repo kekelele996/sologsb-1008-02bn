@@ -1,4 +1,13 @@
-import type { ReviewStatus, SignItem, SignProject, TermBinding } from "./types";
+import type {
+  PublishBatch,
+  PublishedSignSnapshot,
+  RecallDecision,
+  RecallSession,
+  ReviewStatus,
+  SignItem,
+  SignProject,
+  TermBinding,
+} from "./types";
 
 export const uid = (prefix: string) =>
   `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -8,6 +17,126 @@ export const STATUS_LABELS: Record<ReviewStatus, string> = {
   pending: "待确认",
   confirmed: "已确认",
   changes: "需修改",
+};
+
+export const BATCH_STATUS_LABELS = {
+  published: "已发布",
+  recalling: "撤回处理中",
+  recalled: "已撤回",
+} as const;
+
+export const RECALL_DECISION_LABELS: Record<RecallDecision, string> = {
+  keep: "保留本机版",
+  restore: "采用发布版",
+};
+
+/** 冻结一条标识的完整可发布内容。 */
+export const snapshotSign = (sign: SignItem): PublishedSignSnapshot => ({
+  signId: sign.id,
+  code: sign.code,
+  sourceText: sign.sourceText,
+  targetLanguage: sign.targetLanguage,
+  targetText: sign.targetText,
+  scenario: sign.scenario,
+  regulation: sign.regulation,
+  status: sign.status,
+  terms: structuredClone(sign.terms),
+  comments: structuredClone(sign.comments),
+});
+
+/** 把发布快照还原回一条标识（撤回时采用发布版）。 */
+export const restoreSnapshot = (sign: SignItem, snapshot: PublishedSignSnapshot) => {
+  sign.code = snapshot.code;
+  sign.sourceText = snapshot.sourceText;
+  sign.targetLanguage = snapshot.targetLanguage;
+  sign.targetText = snapshot.targetText;
+  sign.scenario = snapshot.scenario;
+  sign.regulation = snapshot.regulation;
+  sign.status = snapshot.status;
+  sign.terms = structuredClone(snapshot.terms);
+  sign.comments = structuredClone(snapshot.comments);
+};
+
+/** 标识已在本机删除时，按发布快照重建一条完整标识。 */
+export const signFromSnapshot = (snapshot: PublishedSignSnapshot): SignItem => ({
+  id: snapshot.signId,
+  code: snapshot.code,
+  sourceText: snapshot.sourceText,
+  targetLanguage: snapshot.targetLanguage,
+  targetText: snapshot.targetText,
+  scenario: snapshot.scenario,
+  regulation: snapshot.regulation,
+  status: snapshot.status,
+  terms: structuredClone(snapshot.terms),
+  comments: structuredClone(snapshot.comments),
+  versions: [],
+  emergencyRevision: false,
+  updatedAt: new Date().toISOString(),
+});
+
+/** 撤回比对：本机当前内容与发布快照是否一致。 */
+export const snapshotMatchesSign = (snapshot: PublishedSignSnapshot, sign: SignItem | undefined) => {
+  if (!sign) return false;
+  return (
+    sign.code === snapshot.code &&
+    sign.sourceText === snapshot.sourceText &&
+    sign.targetLanguage === snapshot.targetLanguage &&
+    sign.targetText === snapshot.targetText &&
+    sign.scenario === snapshot.scenario &&
+    sign.regulation === snapshot.regulation &&
+    sign.status === snapshot.status &&
+    JSON.stringify(sign.terms) === JSON.stringify(snapshot.terms) &&
+    JSON.stringify(sign.comments) === JSON.stringify(snapshot.comments)
+  );
+};
+
+export const createBatch = (signs: SignItem[], label: string): PublishBatch => ({
+  id: uid("batch"),
+  label: label.trim(),
+  createdAt: new Date().toISOString(),
+  status: "published",
+  signs: signs.map(snapshotSign),
+});
+
+export const createRecallSession = (batch: PublishBatch, signs: SignItem[]): RecallSession => ({
+  id: uid("recall"),
+  batchId: batch.id,
+  startedAt: new Date().toISOString(),
+  baseline: batch.signs.map((snapshot) => {
+    const current = signs.find((sign) => sign.id === snapshot.signId);
+    // 以发布快照为兜底，保证中断后仍有可比基线。
+    return current ? snapshotSign(current) : structuredClone(snapshot);
+  }),
+  decisions: {},
+});
+
+export const findBatch = (project: SignProject, batchId: string) =>
+  project.batches.find((batch) => batch.id === batchId);
+
+/** 当前打开的撤回会话。 */
+export const findRecallSession = (project: SignProject, sessionId: string) =>
+  project.recallSessions.find((session) => session.id === sessionId);
+
+/** 当前是否存在未处理完的撤回（含中断重开后未恢复的会话）。 */
+export const findPendingRecall = (project: SignProject): RecallSession | undefined =>
+  project.recallSessions.find((session) => findBatch(project, session.batchId)?.status === "recalling");
+
+export const getRecallProgress = (batch: PublishBatch, session: RecallSession) =>
+  batch.signs.filter((snapshot) => session.decisions[snapshot.signId]).length;
+
+export const isRecallResolved = (batch: PublishBatch, session: RecallSession) =>
+  batch.signs.every(
+    (snapshot) => session.decisions[snapshot.signId] === "keep" || session.decisions[snapshot.signId] === "restore",
+  );
+
+/** 该标识最近一次覆盖它的发布批次；撤回处理期间返回 recalling 批次，使其不显示为已发布。 */
+export const findLatestBatchForSign = (project: SignProject, signId: string): PublishBatch | undefined => {
+  const batches = project.batches.filter((batch) => batch.signs.some((snapshot) => snapshot.signId === signId));
+  return (
+    batches.find((batch) => batch.status === "recalling") ??
+    batches.find((batch) => batch.status === "published") ??
+    undefined
+  );
 };
 
 const term = (source: string, target: string, confirmed = false, required = true): TermBinding => ({
@@ -88,6 +217,15 @@ export const createSeedProject = (): SignProject => {
     location: "滨海交通枢纽一期",
     activeSignId: signs[0].id,
     signs,
+    batches: [],
+    recallSessions: [],
     updatedAt: new Date().toISOString(),
   };
 };
+
+/** 兼容早期没有发布批次字段的本地存档。 */
+export const normalizeProject = (project: SignProject): SignProject => ({
+  ...project,
+  batches: project.batches ?? [],
+  recallSessions: project.recallSessions ?? [],
+});
