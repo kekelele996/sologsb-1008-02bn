@@ -1,8 +1,8 @@
 import { $, component$, useSignal, useVisibleTask$, type QRL } from "@builder.io/qwik";
 import { type DocumentHead } from "@builder.io/qwik-city";
 import { createSeedProject, STATUS_LABELS, uid } from "../data";
-import type { ReviewStatus, SignItem, SignProject } from "../types";
-import { analyzeSign, cloneTerms, diffText } from "../utils";
+import type { ReleaseBatch, ReleaseState, ReviewStatus, SignItem, SignProject, SignSnapshot, WithdrawDecision } from "../types";
+import { analyzeSign, applySnapshot, captureSnapshot, cloneTerms, diffText, hasLocalChanges } from "../utils";
 
 const STORAGE_KEY = "sologsb-1008-project-v1";
 const WIDTHS = [320, 480, 720, 960] as const;
@@ -21,6 +21,20 @@ function statusClass(status: ReviewStatus) {
   return "badge-neutral";
 }
 
+const RELEASE_STATE_LABEL: Record<ReleaseState, string> = {
+  published: "已发布",
+  withdrawing: "撤回处理中",
+  withdrawn: "已撤回",
+};
+
+function releaseStateClass(state: ReleaseState) {
+  if (state === "published") return "badge-success";
+  if (state === "withdrawing") return "badge-warning";
+  return "badge-ghost";
+}
+
+const formatTime = (value: string) => new Date(value).toLocaleString();
+
 export default component$(() => {
   const project = useSignal<SignProject>(createSeedProject());
   const past = useSignal<SignProject[]>([]);
@@ -38,7 +52,30 @@ export default component$(() => {
   const toast = useSignal("");
   const previewId = useSignal("");
   const readOnly = useSignal(false);
+  const selectedSignIds = useSignal<string[]>([]);
+  const releasesOpen = useSignal(false);
+  const activeReleaseId = useSignal<string | null>(null);
   const active = () => project.value.signs.find((sign) => sign.id === (previewId.value || project.value.activeSignId)) ?? project.value.signs[0];
+
+  /** 找到一条标识所属的最新发布点：撤回处理中的批次优先，其次才是已发布，已撤回批次不再算作已发布。 */
+  const signRelease = (signId: string): ReleaseBatch | undefined => {
+    const contains = project.value.releases.filter(
+      (release) => release.state !== "withdrawn" && release.snapshots.some((snapshot) => snapshot.signId === signId),
+    );
+    return contains.find((release) => release.state === "withdrawing") ?? contains[0];
+  };
+
+  const activeRelease = () =>
+    activeReleaseId.value ? project.value.releases.find((release) => release.id === activeReleaseId.value) : undefined;
+
+  /** 撤回处理清单：冻结版与本机当前内容比对，无本机修改的条目自动“采用”，有冲突待逐条选择。 */
+  const withdrawItems = (release: ReleaseBatch) =>
+    release.snapshots.map((snapshot) => {
+      const sign = project.value.signs.find((item) => item.id === snapshot.signId);
+      const conflict = hasLocalChanges(sign, snapshot);
+      const decision = release.decisions[snapshot.signId] ?? (conflict ? undefined : "adopt");
+      return { snapshot, sign, conflict, decision: decision as WithdrawDecision | undefined, resolved: Boolean(decision) };
+    });
 
   const commit = $((label: string, update: (draft: SignProject) => void) => {
     past.value = [...past.value.slice(-49), structuredClone(project.value)];
@@ -102,6 +139,112 @@ export default component$(() => {
       sign.emergencyRevision = !sign.emergencyRevision;
       if (sign.emergencyRevision) sign.status = "changes";
     });
+  });
+
+  // —— 发布批次：批量确认时冻结整组标识，之后可按发布点撤回 ——
+
+  const toggleSelectSign = $((signId: string) => {
+    selectedSignIds.value = selectedSignIds.value.includes(signId)
+      ? selectedSignIds.value.filter((id) => id !== signId)
+      : [...selectedSignIds.value, signId];
+  });
+
+  const toggleSelectAll = $(() => {
+    selectedSignIds.value = selectedSignIds.value.length === project.value.signs.length
+      ? []
+      : project.value.signs.map((sign) => sign.id);
+  });
+
+  const publishBatch = $(() => {
+    const ids = selectedSignIds.value;
+    if (!ids.length) return;
+    const selected = project.value.signs.filter((sign) => ids.includes(sign.id));
+    if (!selected.length) return;
+    const batchId = uid("release");
+    const now = new Date();
+    const name = `发布批次 · ${now.toLocaleDateString()} ${now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+    commit("批量确认并发布", (draft) => {
+      draft.releases.unshift({
+        id: batchId,
+        name,
+        publishedAt: now.toISOString(),
+        state: "published",
+        decisions: {},
+        snapshots: selected.map((sign) => {
+          const target = draft.signs.find((item) => item.id === sign.id)!;
+          // 批量确认：组内标识统一置为已确认后再冻结，保证冻结版即发布版。
+          target.status = "confirmed";
+          return captureSnapshot(target);
+        }),
+      });
+    });
+    selectedSignIds.value = [];
+    activeReleaseId.value = batchId;
+    releasesOpen.value = true;
+    toast.value = `已冻结并发布 ${selected.length} 条标识`;
+  });
+
+  const openRelease = $((releaseId: string) => {
+    activeReleaseId.value = releaseId;
+    releasesOpen.value = true;
+  });
+
+  const closeReleases = $(() => {
+    releasesOpen.value = false;
+    activeReleaseId.value = null;
+  });
+
+  /** 发起撤回：进入“撤回处理中”，未处理完之前该批不再显示为已发布。 */
+  const startWithdraw = $((releaseId: string) => {
+    commit("撤回发布批次", (draft) => {
+      const release = draft.releases.find((item) => item.id === releaseId);
+      if (!release || release.state !== "published") return;
+      release.state = "withdrawing";
+      release.withdrawStartedAt = new Date().toISOString();
+      release.snapshots.forEach((snapshot) => {
+        const sign = draft.signs.find((item) => item.id === snapshot.signId);
+        if (sign && !hasLocalChanges(sign, snapshot)) release.decisions[snapshot.signId] = "adopt";
+      });
+    });
+    toast.value = "批次已进入撤回处理，请逐条确认采用或保留";
+  });
+
+  /** 处理列表中逐条选择：采用该批冻结版，或保留本机未发布修改。选择随项目持久化，关页可续。 */
+  const chooseWithdraw = $((releaseId: string, signId: string, decision: WithdrawDecision) => {
+    commit("记录撤回处理选择", (draft) => {
+      const release = draft.releases.find((item) => item.id === releaseId);
+      if (release) release.decisions[signId] = decision;
+    });
+  });
+
+  /** 全部条目处理完后整批落地：采用冻结版的条目整组还原译文、原文、术语、意见和审校状态。 */
+  const finishWithdraw = $((releaseId: string) => {
+    let unresolved = 0;
+    project.value.releases
+      .find((item) => item.id === releaseId)
+      ?.snapshots.forEach((snapshot) => {
+        const sign = project.value.signs.find((item) => item.id === snapshot.signId);
+        const decision = project.value.releases.find((item) => item.id === releaseId)!.decisions[snapshot.signId]
+          ?? (hasLocalChanges(sign, snapshot) ? undefined : "adopt");
+        if (!decision) unresolved += 1;
+      });
+    if (unresolved > 0) {
+      toast.value = `还有 ${unresolved} 条未处理，无法完成撤回`;
+      return;
+    }
+    commit("完成批次撤回", (draft) => {
+      const release = draft.releases.find((item) => item.id === releaseId);
+      if (!release || release.state !== "withdrawing") return;
+      release.snapshots.forEach((snapshot) => {
+        const decision = release.decisions[snapshot.signId] ?? "adopt";
+        if (decision !== "adopt") return;
+        const sign = draft.signs.find((item) => item.id === snapshot.signId);
+        if (sign) applySnapshot(sign, snapshot);
+      });
+      release.state = "withdrawn";
+      release.withdrawFinishedAt = new Date().toISOString();
+    });
+    toast.value = "发布批次已撤回，冻结版已按选择还原";
   });
 
   const saveVersion = $(() => {
@@ -186,7 +329,11 @@ export default component$(() => {
     if (!hydrated.value) {
       try {
         const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: SignProject };
-        if (stored.schema === 1 && stored.project?.signs?.length) project.value = stored.project;
+        if (stored.schema === 1 && stored.project?.signs?.length) {
+          // 兼容旧版本地数据：没有发布批次记录时补空数组。
+          stored.project.releases ??= [];
+          project.value = stored.project;
+        }
         const requestedPreview = new URLSearchParams(window.location.search).get("preview") ?? "";
         previewId.value = requestedPreview;
         readOnly.value = Boolean(requestedPreview);
@@ -294,6 +441,14 @@ export default component$(() => {
           <span class={`badge ${online.value ? "badge-success" : "badge-warning"} badge-outline`}>{online.value ? "在线" : "离线草稿"}</span>
           <button class="btn btn-ghost btn-sm" disabled={!past.value.length} onClick$={undo}>撤销</button>
           <button class="btn btn-ghost btn-sm" disabled={!future.value.length} onClick$={redo}>重做</button>
+          <button
+            class={`btn btn-sm gap-1.5 border-white/20 bg-white/10 text-white hover:bg-white/20 ${project.value.releases.some((release) => release.state === "withdrawing") ? "ring-2 ring-amber-300" : ""}`}
+            onClick$={() => { activeReleaseId.value = null; releasesOpen.value = true; }}
+          >
+            发布批次
+            <span class="badge badge-sm badge-ghost">{project.value.releases.length}</span>
+            {project.value.releases.some((release) => release.state === "withdrawing") && <span class="badge badge-sm badge-warning">处理中</span>}
+          </button>
           <button class="btn btn-sm border-white/20 bg-white/10 text-white hover:bg-white/20" onClick$={sharePreview}>复制只读链接</button>
           <button class={`btn btn-sm ${active().emergencyRevision ? "btn-error" : "btn-warning"}`} onClick$={toggleEmergency}>
             {active().emergencyRevision ? "退出紧急修订" : "紧急修订"}
@@ -308,6 +463,18 @@ export default component$(() => {
         </div>
       )}
 
+      {project.value.releases.some((release) => release.state === "withdrawing") && (
+        <div class="alert alert-warning sticky z-30 rounded-none border-x-0 py-2">
+          <span class="text-lg">⏳</span>
+          <span class="flex-1">
+            <strong>有发布批次正在撤回处理</strong>：未逐条处理完的批次不会显示为已发布，处理选择已保存在本机，可随时回来继续。
+          </span>
+          {project.value.releases.filter((release) => release.state === "withdrawing").map((release) => (
+            <button key={release.id} class="btn btn-xs btn-outline" onClick$={() => openRelease(release.id)}>继续处理 · {release.name}</button>
+          ))}
+        </div>
+      )}
+
       <div class="grid min-h-[calc(100vh-64px)] grid-cols-[270px_minmax(560px,1fr)_430px] gap-px bg-slate-300">
         <aside class="overflow-y-auto bg-slate-50 p-3">
           <div class="mb-3 rounded-xl bg-white p-4 shadow-sm">
@@ -315,31 +482,74 @@ export default component$(() => {
             <div class="mt-1 text-lg font-bold text-slate-800">{project.value.signs.length} 处标识</div>
             <p class="mt-1 text-xs leading-5 text-slate-500">{project.value.location}</p>
           </div>
+          <div class="mb-3 rounded-xl border border-blue-200 bg-blue-50 p-3 shadow-sm">
+            <label class="flex cursor-pointer items-center gap-2 text-xs font-bold text-slate-600">
+              <input
+                type="checkbox"
+                class="checkbox checkbox-xs checkbox-primary"
+                checked={selectedSignIds.value.length === project.value.signs.length}
+                onChange$={toggleSelectAll}
+              />
+              全选本批标识
+            </label>
+            <div class="mt-2 flex items-center justify-between gap-2">
+              <span class="text-xs text-slate-500">已选 <strong class="text-blue-700">{selectedSignIds.value.length}</strong> / {project.value.signs.length} 条</span>
+              <button
+                class="btn btn-xs btn-primary"
+                disabled={!selectedSignIds.value.length}
+                onClick$={publishBatch}
+              >
+                批量确认发布
+              </button>
+            </div>
+            <p class="mt-2 text-[11px] leading-4 text-slate-400">发布时整组冻结原文、译文、术语、意见与状态，随后可按发布点撤回。</p>
+          </div>
           <div class="space-y-2">
             {project.value.signs.map((sign, index) => {
               const risk = analyzeSign(sign, previewWidth.value, previewFont.value);
+              const selected = selectedSignIds.value.includes(sign.id);
+              const release = signRelease(sign.id);
               return (
-                <button
+                <div
                   key={sign.id}
-                  class={`w-full rounded-xl border p-3 text-left transition ${sign.id === project.value.activeSignId ? "border-blue-400 bg-blue-50 shadow-sm" : "border-slate-200 bg-white hover:border-slate-300"}`}
-                  onClick$={() => {
-                    commit("切换标识", (draft) => { draft.activeSignId = sign.id; });
-                    selectedVersionId.value = "";
-                  }}
+                  class={`relative rounded-xl border transition ${sign.id === project.value.activeSignId ? "border-blue-400 bg-blue-50 shadow-sm" : "border-slate-200 bg-white hover:border-slate-300"} ${selected ? "ring-2 ring-blue-300" : ""}`}
                 >
-                  <div class="flex items-center justify-between">
-                    <span class="font-mono text-xs font-bold text-slate-500">{sign.code}</span>
-                    <span class={`badge badge-sm ${statusClass(sign.status)}`}>{STATUS_LABELS[sign.status]}</span>
-                  </div>
-                  <div class="mt-2 line-clamp-2 text-sm font-semibold text-slate-700">{sign.sourceText}</div>
-                  <div class="mt-2 flex items-center justify-between text-[11px] text-slate-500">
-                    <span>{sign.targetLanguage}</span>
-                    <span class={risk.risk === "high" ? "font-bold text-error" : risk.risk === "medium" ? "font-bold text-warning" : "text-success"}>
-                      {risk.risk === "high" ? "高风险" : risk.risk === "medium" ? "需留意" : "版面正常"}
-                    </span>
-                  </div>
-                  <span class="sr-only">第 {index + 1} 条</span>
-                </button>
+                  <input
+                    type="checkbox"
+                    class="checkbox checkbox-xs checkbox-primary absolute left-2.5 top-3 z-10"
+                    checked={selected}
+                    onClick$={(event) => event.stopPropagation()}
+                    onChange$={() => toggleSelectSign(sign.id)}
+                    aria-label={`选择 ${sign.code}`}
+                  />
+                  <button
+                    class="w-full p-3 pl-8 text-left"
+                    onClick$={() => {
+                      commit("切换标识", (draft) => { draft.activeSignId = sign.id; });
+                      selectedVersionId.value = "";
+                    }}
+                  >
+                    <div class="flex items-center justify-between">
+                      <span class="font-mono text-xs font-bold text-slate-500">{sign.code}</span>
+                      <span class={`badge badge-sm ${statusClass(sign.status)}`}>{STATUS_LABELS[sign.status]}</span>
+                    </div>
+                    <div class="mt-2 line-clamp-2 text-sm font-semibold text-slate-700">{sign.sourceText}</div>
+                    {release && (
+                      <div class="mt-2">
+                        <span class={`badge badge-xs ${releaseStateClass(release.state)}`}>
+                          {release.state === "withdrawing" ? "撤回处理中" : "已发布"}
+                        </span>
+                      </div>
+                    )}
+                    <div class="mt-2 flex items-center justify-between text-[11px] text-slate-500">
+                      <span>{sign.targetLanguage}</span>
+                      <span class={risk.risk === "high" ? "font-bold text-error" : risk.risk === "medium" ? "font-bold text-warning" : "text-success"}>
+                        {risk.risk === "high" ? "高风险" : risk.risk === "medium" ? "需留意" : "版面正常"}
+                      </span>
+                    </div>
+                    <span class="sr-only">第 {index + 1} 条</span>
+                  </button>
+                </div>
               );
             })}
           </div>
@@ -552,7 +762,226 @@ export default component$(() => {
         </aside>
       </div>
 
-      {toast.value && <div class="toast toast-end z-50"><div class="alert alert-success"><span>{toast.value}</span></div></div>}
+      {releasesOpen.value && (
+        <div class="modal modal-open z-50">
+          <div class="modal-box max-w-3xl">
+            {(() => {
+              const release = activeRelease();
+              if (!release) {
+                return (
+                  <>
+                    <div class="flex items-start justify-between">
+                      <div>
+                        <h3 class="text-lg font-bold">发布批次</h3>
+                        <p class="text-xs text-slate-500">批量确认时整组冻结标识；任一发布点都可撤回，撤回逐条还原该批译文、术语、意见与状态。</p>
+                      </div>
+                      <button class="btn btn-sm btn-circle btn-ghost" onClick$={closeReleases}>✕</button>
+                    </div>
+                    <div class="mt-4 space-y-3">
+                      {project.value.releases.length === 0 && (
+                        <div class="rounded-xl border border-dashed p-8 text-center text-sm text-slate-400">
+                          还没有发布批次。在左侧清单勾选标识后点击“批量确认发布”。
+                        </div>
+                      )}
+                      {project.value.releases.map((item) => {
+                        const processed = item.snapshots.filter((snapshot) => item.decisions[snapshot.signId]).length;
+                        return (
+                          <div key={item.id} class="flex items-center justify-between gap-3 rounded-xl border border-slate-200 p-4">
+                            <div class="min-w-0">
+                              <div class="flex flex-wrap items-center gap-2">
+                                <strong class="truncate">{item.name}</strong>
+                                <span class={`badge badge-sm ${releaseStateClass(item.state)}`}>{RELEASE_STATE_LABEL[item.state]}</span>
+                                <span class="badge badge-sm badge-ghost">{item.snapshots.length} 条</span>
+                              </div>
+                              <div class="mt-1 text-xs text-slate-500">
+                                发布于 {formatTime(item.publishedAt)}
+                                {item.state === "withdrawing" && (
+                                  <span class="text-warning"> · 处理进度 {processed}/{item.snapshots.length}（选择已自动保存，可关页后续做）</span>
+                                )}
+                                {item.state === "withdrawn" && item.withdrawFinishedAt && (
+                                  <span> · 撤回完成 {formatTime(item.withdrawFinishedAt)}</span>
+                                )}
+                              </div>
+                            </div>
+                            {item.state === "published" && (
+                              <button class="btn btn-sm btn-outline btn-warning shrink-0" onClick$={() => startWithdraw(item.id)}>撤回此发布点</button>
+                            )}
+                            {item.state === "withdrawing" && (
+                              <button class="btn btn-sm btn-warning shrink-0" onClick$={() => openRelease(item.id)}>继续处理 {processed}/{item.snapshots.length}</button>
+                            )}
+                            {item.state === "withdrawn" && (
+                              <button class="btn btn-sm btn-ghost shrink-0" onClick$={() => openRelease(item.id)}>查看记录</button>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </>
+                );
+              }
+
+              const items = withdrawItems(release);
+              const resolvedCount = items.filter((entry) => entry.resolved).length;
+              const readOnlyBatch = release.state === "withdrawn";
+
+              const renderSnapshotContent = (snapshot: SignSnapshot) => (
+                <div class="space-y-2">
+                  <div class="rounded-lg bg-slate-100 p-2">
+                    <div class="text-[10px] font-bold uppercase tracking-wider text-slate-400">中文原文</div>
+                    <p class="mt-0.5 whitespace-pre-line text-xs leading-5">{snapshot.sourceText}</p>
+                  </div>
+                  <div class="rounded-lg bg-slate-100 p-2">
+                    <div class="text-[10px] font-bold uppercase tracking-wider text-slate-400">译文 · {snapshot.targetLanguage}</div>
+                    <p class="mt-0.5 whitespace-pre-line text-xs leading-5">{snapshot.targetText}</p>
+                  </div>
+                  <div class="flex flex-wrap gap-1">
+                    {snapshot.terms.map((term) => (
+                      <span key={term.id} class={`badge badge-xs ${term.confirmed ? "badge-success" : "badge-warning"}`}>{term.source} → {term.target}</span>
+                    ))}
+                  </div>
+                  <div>
+                    <div class="text-[10px] font-bold uppercase tracking-wider text-slate-400">审校意见 {snapshot.comments.length} 条</div>
+                    {snapshot.comments.length === 0 && <p class="text-[11px] text-slate-400">无意见</p>}
+                    {snapshot.comments.map((comment) => (
+                      <div key={comment.id} class={`mt-1 border-l-2 pl-2 text-[11px] leading-4 ${comment.resolved ? "border-success text-slate-400 line-through" : "border-warning"}`}>
+                        <strong>{comment.author}</strong>：{comment.body}
+                      </div>
+                    ))}
+                  </div>
+                  <span class={`badge badge-xs ${statusClass(snapshot.status)}`}>发布时状态：{STATUS_LABELS[snapshot.status]}</span>
+                </div>
+              );
+
+              const renderCurrentContent = (entry: (typeof items)[number]) => {
+                const sign = entry.sign;
+                if (!sign) return <p class="text-xs text-error">本机已找不到该标识，将直接采用发布冻结版。</p>;
+                return (
+                  <div class="space-y-2">
+                    <div class="rounded-lg bg-slate-100 p-2">
+                      <div class="text-[10px] font-bold uppercase tracking-wider text-slate-400">中文原文</div>
+                      <p class="mt-0.5 whitespace-pre-line text-xs leading-5">{sign.sourceText}</p>
+                    </div>
+                    <div class="rounded-lg bg-slate-100 p-2">
+                      <div class="text-[10px] font-bold uppercase tracking-wider text-slate-400">译文 · {sign.targetLanguage}</div>
+                      <p class="mt-0.5 whitespace-pre-line text-xs leading-5">{sign.targetText}</p>
+                    </div>
+                    <div class="flex flex-wrap gap-1">
+                      {sign.terms.map((term) => (
+                        <span key={term.id} class={`badge badge-xs ${term.confirmed ? "badge-success" : "badge-warning"}`}>{term.source} → {term.target}</span>
+                      ))}
+                    </div>
+                    <div>
+                      <div class="text-[10px] font-bold uppercase tracking-wider text-slate-400">审校意见 {sign.comments.length} 条</div>
+                      {sign.comments.length === 0 && <p class="text-[11px] text-slate-400">无意见</p>}
+                      {sign.comments.map((comment) => (
+                        <div key={comment.id} class={`mt-1 border-l-2 pl-2 text-[11px] leading-4 ${comment.resolved ? "border-success text-slate-400 line-through" : "border-warning"}`}>
+                          <strong>{comment.author}</strong>：{comment.body}
+                        </div>
+                      ))}
+                    </div>
+                    <span class={`badge badge-xs ${statusClass(sign.status)}`}>本机当前状态：{STATUS_LABELS[sign.status]}</span>
+                  </div>
+                );
+              };
+
+              return (
+                <>
+                  <div class="flex items-start justify-between gap-3">
+                    <div>
+                      <button class="btn btn-xs btn-ghost -ml-2" onClick$={() => { activeReleaseId.value = null; }}>← 返回批次列表</button>
+                      <h3 class="mt-1 text-lg font-bold">{release.name}</h3>
+                      <div class="mt-1 flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                        <span class={`badge badge-sm ${releaseStateClass(release.state)}`}>{RELEASE_STATE_LABEL[release.state]}</span>
+                        <span>发布于 {formatTime(release.publishedAt)}</span>
+                        {release.state === "withdrawing" && (
+                          <span class="font-bold text-warning">处理进度 {resolvedCount}/{items.length}，未处理完不会标记已发布</span>
+                        )}
+                      </div>
+                    </div>
+                    <button class="btn btn-sm btn-circle btn-ghost" onClick$={closeReleases}>✕</button>
+                  </div>
+
+                  <div class="mt-4 max-h-[60vh] space-y-3 overflow-y-auto pr-1">
+                    {items.map((entry) => (
+                      <section key={entry.snapshot.signId} class={`rounded-xl border p-3 ${entry.conflict ? "border-amber-300 bg-amber-50/50" : "border-slate-200"}`}>
+                        <div class="flex flex-wrap items-center justify-between gap-2">
+                          <div class="flex items-center gap-2">
+                            <span class="font-mono text-xs font-bold">{entry.snapshot.code}</span>
+                            {entry.conflict
+                              ? <span class="badge badge-xs badge-error">本机有未发布修改</span>
+                              : <span class="badge badge-xs badge-ghost">本机无改动</span>}
+                          </div>
+                          {!readOnlyBatch && (
+                            <div class="join">
+                              <button
+                                class={`btn join-item btn-xs ${entry.decision === "adopt" ? "btn-primary" : "btn-outline"}`}
+                                onClick$={() => chooseWithdraw(release.id, entry.snapshot.signId, "adopt")}
+                              >
+                                采用发布冻结版
+                              </button>
+                              <button
+                                class={`btn join-item btn-xs ${entry.decision === "keep" ? "btn-primary" : "btn-outline"}`}
+                                onClick$={() => chooseWithdraw(release.id, entry.snapshot.signId, "keep")}
+                              >
+                                保留本机修改
+                              </button>
+                            </div>
+                          )}
+                          {readOnlyBatch && (
+                            <span class="text-xs text-slate-400">
+                              处理结果：{release.decisions[entry.snapshot.signId] === "keep" ? "保留本机修改" : "已采用冻结版"}
+                            </span>
+                          )}
+                        </div>
+                        {!entry.conflict && release.state === "withdrawing" && (
+                          <p class="mt-2 text-[11px] text-slate-500">本机与冻结版一致，默认采用；也可显式改选。</p>
+                        )}
+                        <div class="mt-2 grid gap-2 md:grid-cols-2">
+                          <div>
+                            <div class="mb-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">该批冻结版</div>
+                            {renderSnapshotContent(entry.snapshot)}
+                          </div>
+                          <div>
+                            <div class="mb-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">本机当前内容</div>
+                            {renderCurrentContent(entry)}
+                          </div>
+                        </div>
+                      </section>
+                    ))}
+                  </div>
+
+                  <div class="modal-action">
+                    {release.state === "published" && (
+                      <button class="btn btn-sm btn-outline btn-warning" onClick$={() => startWithdraw(release.id)}>撤回此发布点</button>
+                    )}
+                    {release.state === "withdrawing" && (
+                      <>
+                        <span class="mr-auto self-center text-xs text-slate-500">
+                          {resolvedCount === items.length ? "全部条目已处理，可以完成撤回。" : `还有 ${items.length - resolvedCount} 条待选择，可先关闭稍后继续。`}
+                        </span>
+                        <button class="btn btn-sm btn-ghost" onClick$={closeReleases}>保存进度并关闭</button>
+                        <button
+                          class="btn btn-sm btn-warning"
+                          disabled={resolvedCount !== items.length}
+                          onClick$={() => finishWithdraw(release.id)}
+                        >
+                          完成撤回并还原 ({resolvedCount}/{items.length})
+                        </button>
+                      </>
+                    )}
+                    {release.state === "withdrawn" && (
+                      <button class="btn btn-sm btn-ghost" onClick$={closeReleases}>关闭</button>
+                    )}
+                  </div>
+                </>
+              );
+            })()}
+          </div>
+          <button class="modal-backdrop" aria-label="关闭" onClick$={closeReleases}></button>
+        </div>
+      )}
+
+      {toast.value && <div class="toast toast-end z-[60]"><div class="alert alert-success"><span>{toast.value}</span></div></div>}
     </div>
   );
 });

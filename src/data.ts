@@ -1,4 +1,5 @@
-import type { ReviewStatus, SignItem, SignProject, TermBinding } from "./types";
+import type { ReleaseBatch, ReviewStatus, SignItem, SignProject, TermBinding } from "./types";
+import { captureSnapshot } from "./utils";
 
 export const uid = (prefix: string) =>
   `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -45,10 +46,19 @@ export const createSeedProject = (): SignProject => {
       regulation: "GB 13495.1-2015 消防安全标志",
       status: "confirmed",
       terms: [term("紧急出口", "EMERGENCY EXIT", true), term("电梯", "elevator", true)],
-      comments: [],
+      comments: [
+        {
+          id: uid("comment"),
+          author: "版面审校员",
+          body: "术语统一改为 elevator；上一批冻结的 lift 是误译，发布批次撤回时选择保留本机修改。",
+          createdAt: "2026-09-25T03:30:00.000Z",
+          resolved: false,
+          replies: [],
+        },
+      ],
       versions: [],
       emergencyRevision: false,
-      updatedAt: "2026-09-18T06:10:00.000Z",
+      updatedAt: "2026-09-25T03:30:00.000Z",
     },
     {
       id: "sign-water",
@@ -82,12 +92,34 @@ export const createSeedProject = (): SignProject => {
     },
   ];
 
+  const platform = signs[0];
+  const exit = signs[1];
+
+  // 已发布的第一批：冻结 EM-02 时用的是误译 lift，之后本机已改为 elevator 且留有审校意见，
+  // 方便演示“撤回时逐条选择采用发布版或保留本机未发布修改”。
+  const frozenExit: SignItem = structuredClone(exit);
+  frozenExit.targetText =
+    "EMERGENCY EXIT\nIn an emergency, leave quickly in the direction shown. Do not use the lift.";
+  const liftTerm = frozenExit.terms.find((item) => item.source === "电梯");
+  if (liftTerm) liftTerm.target = "lift";
+  frozenExit.comments = [];
+
+  const firstRelease: ReleaseBatch = {
+    id: uid("release"),
+    name: "首批交通枢纽标识（2026-09-20）",
+    publishedAt: "2026-09-20T08:00:00.000Z",
+    state: "published",
+    snapshots: [captureSnapshot(platform), captureSnapshot(frozenExit)],
+    decisions: {},
+  };
+
   return {
     id: "public-sign-review-1008",
     title: "城市公共标识多语言校对",
     location: "滨海交通枢纽一期",
     activeSignId: signs[0].id,
     signs,
+    releases: [firstRelease],
     updatedAt: new Date().toISOString(),
   };
 };

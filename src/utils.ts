@@ -1,4 +1,4 @@
-import type { DiffToken, SignItem, TermBinding } from "./types";
+import type { DiffToken, SignItem, SignSnapshot, TermBinding } from "./types";
 
 export function estimatedLines(text: string, width: number, fontSize: number, lineHeight = 1.25) {
   if (!text.trim()) return [];
@@ -103,4 +103,47 @@ export function diffText(oldText: string, newText: string): DiffToken[] {
 
 export function cloneTerms(terms: TermBinding[]) {
   return structuredClone(terms);
+}
+
+/** 发布时冻结一条标识：原文、译文、术语、审校意见与审校状态整组快照。 */
+export function captureSnapshot(sign: SignItem): SignSnapshot {
+  return {
+    signId: sign.id,
+    code: sign.code,
+    sourceText: sign.sourceText,
+    targetText: sign.targetText,
+    targetLanguage: sign.targetLanguage,
+    scenario: sign.scenario,
+    regulation: sign.regulation,
+    status: sign.status,
+    terms: structuredClone(sign.terms),
+    comments: structuredClone(sign.comments),
+  };
+}
+
+/** 撤回处理时，对照发布冻结版判断本机是否存在未发布修改。 */
+export function hasLocalChanges(sign: SignItem | undefined, snapshot: SignSnapshot) {
+  if (!sign) return false;
+  return (
+    sign.sourceText !== snapshot.sourceText ||
+    sign.targetText !== snapshot.targetText ||
+    sign.targetLanguage !== snapshot.targetLanguage ||
+    sign.scenario !== snapshot.scenario ||
+    sign.regulation !== snapshot.regulation ||
+    sign.status !== snapshot.status ||
+    JSON.stringify(sign.terms) !== JSON.stringify(snapshot.terms) ||
+    JSON.stringify(sign.comments) !== JSON.stringify(snapshot.comments)
+  );
+}
+
+/** 采用发布冻结版：整组还原该批译文、原文、术语、意见和审校状态。 */
+export function applySnapshot(sign: SignItem, snapshot: SignSnapshot) {
+  sign.sourceText = snapshot.sourceText;
+  sign.targetText = snapshot.targetText;
+  sign.targetLanguage = snapshot.targetLanguage;
+  sign.scenario = snapshot.scenario;
+  sign.regulation = snapshot.regulation;
+  sign.status = snapshot.status;
+  sign.terms = structuredClone(snapshot.terms);
+  sign.comments = structuredClone(snapshot.comments);
 }

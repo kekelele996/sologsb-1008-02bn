@@ -50,12 +50,42 @@ export interface SignItem {
   updatedAt: string;
 }
 
+export interface SignSnapshot {
+  signId: string;
+  code: string;
+  sourceText: string;
+  targetText: string;
+  targetLanguage: string;
+  scenario: string;
+  regulation: string;
+  status: ReviewStatus;
+  terms: TermBinding[];
+  comments: ReviewComment[];
+}
+
+export type ReleaseState = "published" | "withdrawing" | "withdrawn";
+
+export type WithdrawDecision = "adopt" | "keep";
+
+export interface ReleaseBatch {
+  id: string;
+  name: string;
+  publishedAt: string;
+  state: ReleaseState;
+  snapshots: SignSnapshot[];
+  /** 撤回处理时每条标识的选择：adopt 采用发布冻结版 / keep 保留本机未发布修改 */
+  decisions: Record<string, WithdrawDecision>;
+  withdrawStartedAt?: string;
+  withdrawFinishedAt?: string;
+}
+
 export interface SignProject {
   id: string;
   title: string;
   location: string;
   activeSignId: string;
   signs: SignItem[];
+  releases: ReleaseBatch[];
   updatedAt: string;
 }
 
